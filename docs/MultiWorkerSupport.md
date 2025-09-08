@@ -138,12 +138,48 @@ Add more workers to increase processing capacity.
 ### Deployment Flexibility
 Deploy different worker types to different machines or containers based on resource requirements.
 
+### Latency Optimization (New in v3.3.0)
+The framework now includes intelligent work item filtering to reduce latency when workers encounter incompatible orchestration/activity types:
+
+- **Adaptive Filtering**: When a worker encounters a `TypeMissingException` for a specific orchestration/activity type, it marks that type as incompatible
+- **Smart Retry Avoidance**: Future work items for incompatible types are immediately released back to the queue instead of being processed
+- **Automatic Expiry**: Incompatible type markers automatically expire after 5 minutes to handle deployment scenarios
+- **Reduced Latency**: Eliminates the 10-second backoff delay that previously occurred on each `TypeMissingException`
+
+This optimization is particularly beneficial in scenarios where:
+- Workers are specialized for different orchestration types
+- Multiple workers share the same task hub
+- High throughput is required with mixed workload types
+
+```csharp
+// Example: With the optimization, if Worker1 doesn't have CustomerOnboardingOrchestration,
+// it will quickly skip processing such work items after the first encounter,
+// allowing Worker2 to handle them without unnecessary delays
+
+var worker1 = new TaskHubWorker(sharedService);
+worker1.AddTaskOrchestrations(typeof(PaymentOrchestration));
+
+var worker2 = new TaskHubWorker(sharedService);  
+worker2.AddTaskOrchestrations(typeof(CustomerOnboardingOrchestration));
+
+// CustomerOnboardingOrchestration instances will be efficiently routed to Worker2
+// after Worker1 learns it cannot handle this type
+```
+
 ## Monitoring and Troubleshooting
 
 ### TypeMissingException Patterns
 Monitor for `TypeMissingException` patterns in your logs:
 - Frequent exceptions may indicate missing worker registrations
 - Check that all required orchestrations/activities are registered on at least one worker
+- **Note**: With the new latency optimization, you should see fewer repeated `TypeMissingException` instances for the same types, as workers learn to avoid incompatible work items
+
+### Latency Optimization Monitoring
+The new work item filtering can be monitored through trace events:
+- `TaskOrchestrationDispatcher-IncompatibleTypeSkipped`: Orchestration work item skipped due to incompatibility
+- `TaskActivityDispatcher-IncompatibleTypeSkipped`: Activity work item skipped due to incompatibility
+
+These events indicate the optimization is working correctly and reducing unnecessary processing overhead.
 
 ### Worker Health Checks
 Implement health checks that verify worker capabilities:

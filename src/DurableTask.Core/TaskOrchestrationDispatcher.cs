@@ -49,6 +49,7 @@ namespace DurableTask.Core
         readonly EntityBackendProperties? entityBackendProperties;
         readonly TaskOrchestrationEntityParameters? entityParameters;
         readonly VersioningSettings? versioningSettings;
+        readonly WorkItemTypeFilter typeFilter;
 
         internal TaskOrchestrationDispatcher(
             IOrchestrationService orchestrationService,
@@ -67,6 +68,7 @@ namespace DurableTask.Core
             this.entityBackendProperties = this.entityOrchestrationService?.EntityBackendProperties;
             this.entityParameters = TaskOrchestrationEntityParameters.FromEntityBackendProperties(this.entityBackendProperties);
             this.versioningSettings = versioningSettings;
+            this.typeFilter = new WorkItemTypeFilter();
 
             this.dispatcher = new WorkItemDispatcher<TaskOrchestrationWorkItem>(
                 "TaskOrchestrationDispatcher",
@@ -308,6 +310,25 @@ namespace DurableTask.Core
         /// <param name="workItem">The work item to process</param>
         protected async Task<bool> OnProcessWorkItemAsync(TaskOrchestrationWorkItem workItem)
         {
+            // Early check: if this orchestration type is known to be incompatible with this worker,
+            // immediately release the work item to avoid unnecessary processing and latency
+            OrchestrationRuntimeState workItemRuntimeState = workItem.OrchestrationRuntimeState;
+            if (workItemRuntimeState?.Name != null && this.typeFilter.IsTypeIncompatible(workItemRuntimeState.Name, workItemRuntimeState.Version))
+            {
+                this.logHelper.DroppingOrchestrationWorkItem(workItem, $"Orchestration type ({workItemRuntimeState.Name}, {workItemRuntimeState.Version}) is marked as incompatible with this worker");
+                TraceHelper.TraceInstance(
+                    TraceEventType.Information,
+                    "TaskOrchestrationDispatcher-IncompatibleTypeSkipped",
+                    workItemRuntimeState.OrchestrationInstance!,
+                    "Skipping orchestration ({0}, {1}) marked as incompatible with this worker",
+                    workItemRuntimeState.Name,
+                    workItemRuntimeState.Version ?? "");
+                
+                // Release the work item immediately so another worker can pick it up
+                await this.orchestrationService.ReleaseTaskOrchestrationWorkItemAsync(workItem);
+                return true; // Mark as completed to avoid further processing
+            }
+
             var messagesToSend = new List<TaskMessage>();
             var timerMessages = new List<TaskMessage>();
             var orchestratorMessages = new List<TaskMessage>();
@@ -751,6 +772,9 @@ namespace DurableTask.Core
 
                 if (taskOrchestration == null)
                 {
+                    // Mark this orchestration type as incompatible with this worker to avoid future retries
+                    this.typeFilter.MarkTypeAsIncompatible(runtimeState.Name, runtimeState.Version);
+                    
                     throw TraceHelper.TraceExceptionInstance(
                         TraceEventType.Error,
                         "TaskOrchestrationDispatcher-TypeMissing",

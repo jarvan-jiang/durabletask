@@ -36,6 +36,7 @@ namespace DurableTask.Core
         readonly DispatchMiddlewarePipeline dispatchPipeline;
         readonly LogHelper logHelper;
         readonly ErrorPropagationMode errorPropagationMode;
+        readonly WorkItemTypeFilter typeFilter;
 
         internal TaskActivityDispatcher(
             IOrchestrationService orchestrationService,
@@ -49,6 +50,7 @@ namespace DurableTask.Core
             this.dispatchPipeline = dispatchPipeline ?? throw new ArgumentNullException(nameof(dispatchPipeline));
             this.logHelper = logHelper;
             this.errorPropagationMode = errorPropagationMode;
+            this.typeFilter = new WorkItemTypeFilter();
 
             this.dispatcher = new WorkItemDispatcher<TaskActivityWorkItem>(
                 "TaskActivityDispatcher",
@@ -141,6 +143,24 @@ namespace DurableTask.Core
                         new InvalidOperationException(message));
                 }
 
+                // Early check: if this activity type is known to be incompatible with this worker,
+                // immediately release the work item to avoid unnecessary processing and latency
+                if (this.typeFilter.IsTypeIncompatible(scheduledEvent.Name, scheduledEvent.Version))
+                {
+                    this.logHelper.TaskActivityDispatcherError(workItem, $"Activity type ({scheduledEvent.Name}, {scheduledEvent.Version}) is marked as incompatible with this worker");
+                    TraceHelper.TraceInstance(
+                        TraceEventType.Information,
+                        "TaskActivityDispatcher-IncompatibleTypeSkipped",
+                        orchestrationInstance,
+                        "Skipping activity ({0}, {1}) marked as incompatible with this worker",
+                        scheduledEvent.Name,
+                        scheduledEvent.Version ?? "");
+                    
+                    // Release the work item immediately so another worker can pick it up
+                    await this.orchestrationService.AbandonTaskActivityWorkItemAsync(workItem);
+                    return; // Exit early to avoid further processing
+                }
+
                 this.logHelper.TaskActivityStarting(orchestrationInstance, scheduledEvent);
                 TaskActivity? taskActivity = this.objectManager.GetObject(scheduledEvent.Name, scheduledEvent.Version);
 
@@ -177,6 +197,9 @@ namespace DurableTask.Core
                     {
                         if (taskActivity == null)
                         {
+                            // Mark this activity type as incompatible with this worker to avoid future retries
+                            this.typeFilter.MarkTypeAsIncompatible(scheduledEvent.Name, scheduledEvent.Version);
+                            
                             // This likely indicates a deployment error of some kind. Because these unhandled exceptions are
                             // automatically retried, resolving this may require redeploying the app code so that the activity exists again.
                             // CONSIDER: Should this be changed into a permanent error that fails the orchestration? Perhaps
