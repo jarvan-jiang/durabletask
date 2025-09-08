@@ -13,6 +13,7 @@
 #nullable enable
 namespace DurableTask.Core
 {
+    using System.Collections.Generic;
     /// <summary>
     /// Interface for name and version manager class to be used in type lookup mappings
     /// </summary>
@@ -31,5 +32,11 @@ namespace DurableTask.Core
         /// <param name="version">Version of the class to return the creator for</param>
         /// <returns>Class instance based on the matching creator class for the supplied name and version</returns>
         T? GetObject(string name, string? version);
+
+        /// <summary>
+        /// Gets all registered object creators with their names and versions
+        /// </summary>
+        /// <returns>Collection of registered object creators</returns>
+        IEnumerable<ObjectCreator<T>> GetRegisteredCreators();
     }
 }

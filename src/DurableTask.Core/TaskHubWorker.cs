@@ -695,6 +695,48 @@ namespace DurableTask.Core
             return this;
         }
 
+        /// <summary>
+        /// Gets information about all registered orchestrations in this worker
+        /// </summary>
+        /// <returns>Collection of registered orchestration information</returns>
+        public IEnumerable<WorkerRegistrationInfo> GetRegisteredOrchestrations()
+        {
+            return this.orchestrationManager.GetRegisteredCreators()
+                .Select(creator => new WorkerRegistrationInfo(creator.Name, creator.Version));
+        }
+
+        /// <summary>
+        /// Gets information about all registered activities in this worker
+        /// </summary>
+        /// <returns>Collection of registered activity information</returns>
+        public IEnumerable<WorkerRegistrationInfo> GetRegisteredActivities()
+        {
+            return this.activityManager.GetRegisteredCreators()
+                .Select(creator => new WorkerRegistrationInfo(creator.Name, creator.Version));
+        }
+
+        /// <summary>
+        /// Gets information about all registered entities in this worker
+        /// </summary>
+        /// <returns>Collection of registered entity information</returns>
+        public IEnumerable<WorkerRegistrationInfo> GetRegisteredEntities()
+        {
+            return this.entityManager.GetRegisteredCreators()
+                .Select(creator => new WorkerRegistrationInfo(creator.Name, creator.Version));
+        }
+
+        /// <summary>
+        /// Gets a summary of all registrations in this worker for diagnostic purposes
+        /// </summary>
+        /// <returns>Summary of worker capabilities</returns>
+        public WorkerCapabilitySummary GetWorkerCapabilities()
+        {
+            return new WorkerCapabilitySummary(
+                GetRegisteredOrchestrations().ToList(),
+                GetRegisteredActivities().ToList(),
+                GetRegisteredEntities().ToList());
+        }
+
         /// <inheritdoc />
         public void Dispose()
         {
