@@ -129,19 +129,111 @@ namespace DurableTask.Core
         /// <param name="receiveTimeout">The max timeout to wait</param>
         /// <param name="cancellationToken">A cancellation token used to cancel a fetch operation.</param>
         /// <returns>A new TaskOrchestrationWorkItem</returns>
-        protected Task<TaskOrchestrationWorkItem> OnFetchWorkItemAsync(TimeSpan receiveTimeout, CancellationToken cancellationToken)
+        protected async Task<TaskOrchestrationWorkItem> OnFetchWorkItemAsync(TimeSpan receiveTimeout, CancellationToken cancellationToken)
         {
+            return await this.FetchCompatibleWorkItemAsync(receiveTimeout, cancellationToken);
+        }
+
+        /// <summary>
+        /// Proactively fetches work items, immediately releasing any that are incompatible with this worker
+        /// </summary>
+        private async Task<TaskOrchestrationWorkItem> FetchCompatibleWorkItemAsync(TimeSpan receiveTimeout, CancellationToken cancellationToken)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var remainingTimeout = receiveTimeout;
+            
+            while (!cancellationToken.IsCancellationRequested && remainingTimeout > TimeSpan.Zero)
+            {
+                TaskOrchestrationWorkItem workItem;
+                
+                // Fetch work item using the original logic
+                if (this.entityBackendProperties?.UseSeparateQueueForEntityWorkItems == true)
+                {
+                    // only orchestrations should be served by this dispatcher, so we call
+                    // the method which returns work items for orchestrations only.
+                    workItem = await this.entityOrchestrationService!.LockNextOrchestrationWorkItemAsync(remainingTimeout, cancellationToken);
+                }
+                else
+                {
+                    // both entities and orchestrations are served by this dispatcher,
+                    // so we call the method that may return work items for either.
+                    workItem = await this.orchestrationService.LockNextTaskOrchestrationWorkItemAsync(remainingTimeout, cancellationToken);
+                }
+
+                // If no work item was returned (timeout), fall back to original behavior
+                if (workItem == null)
+                {
+                    // Call the original fetch logic to maintain expected behavior
+                    if (this.entityBackendProperties?.UseSeparateQueueForEntityWorkItems == true)
+                    {
+                        return await this.entityOrchestrationService!.LockNextOrchestrationWorkItemAsync(remainingTimeout, cancellationToken);
+                    }
+                    else
+                    {
+                        return await this.orchestrationService.LockNextTaskOrchestrationWorkItemAsync(remainingTimeout, cancellationToken);
+                    }
+                }
+
+                // Check if this orchestration type is compatible with this worker
+                var runtimeState = workItem.OrchestrationRuntimeState;
+                if (runtimeState?.Name != null)
+                {
+                    // First check if it's marked as incompatible from previous attempts
+                    if (this.typeFilter.IsTypeIncompatible(runtimeState.Name, runtimeState.Version))
+                    {
+                        // Proactively release incompatible work item and continue searching
+                        this.logHelper.DroppingOrchestrationWorkItem(workItem, $"Proactively releasing orchestration type ({runtimeState.Name}, {runtimeState.Version}) marked as incompatible with this worker");
+                        TraceHelper.TraceInstance(
+                            TraceEventType.Information,
+                            "TaskOrchestrationDispatcher-ProactiveIncompatibleTypeSkipped",
+                            runtimeState.OrchestrationInstance!,
+                            "Proactively releasing orchestration ({0}, {1}) marked as incompatible with this worker",
+                            runtimeState.Name,
+                            runtimeState.Version ?? "");
+                        
+                        await this.orchestrationService.ReleaseTaskOrchestrationWorkItemAsync(workItem);
+                        
+                        // Update remaining timeout and continue searching
+                        remainingTimeout = receiveTimeout - stopwatch.Elapsed;
+                        continue;
+                    }
+
+                    // Additionally, check if we have the orchestration registered (proactive check)
+                    var orchestration = this.objectManager.GetObject(runtimeState.Name, runtimeState.Version);
+                    if (orchestration == null)
+                    {
+                        // We don't have this orchestration type registered, mark it as incompatible and release
+                        this.typeFilter.MarkTypeAsIncompatible(runtimeState.Name, runtimeState.Version);
+                        
+                        this.logHelper.DroppingOrchestrationWorkItem(workItem, $"Proactively releasing unregistered orchestration type ({runtimeState.Name}, {runtimeState.Version})");
+                        TraceHelper.TraceInstance(
+                            TraceEventType.Information,
+                            "TaskOrchestrationDispatcher-ProactiveUnregisteredTypeSkipped",
+                            runtimeState.OrchestrationInstance!,
+                            "Proactively releasing unregistered orchestration ({0}, {1})",
+                            runtimeState.Name,
+                            runtimeState.Version ?? "");
+                        
+                        await this.orchestrationService.ReleaseTaskOrchestrationWorkItemAsync(workItem);
+                        
+                        // Update remaining timeout and continue searching
+                        remainingTimeout = receiveTimeout - stopwatch.Elapsed;
+                        continue;
+                    }
+                }
+
+                // This work item is compatible, return it for processing
+                return workItem;
+            }
+
+            // Timeout reached or cancellation requested - fall back to original behavior
             if (this.entityBackendProperties?.UseSeparateQueueForEntityWorkItems == true)
             {
-                // only orchestrations should be served by this dispatcher, so we call
-                // the method which returns work items for orchestrations only.
-                return this.entityOrchestrationService!.LockNextOrchestrationWorkItemAsync(receiveTimeout, cancellationToken);
+                return await this.entityOrchestrationService!.LockNextOrchestrationWorkItemAsync(TimeSpan.Zero, cancellationToken);
             }
             else
             {
-                // both entities and orchestrations are served by this dispatcher,
-                // so we call the method that may return work items for either.
-                return this.orchestrationService.LockNextTaskOrchestrationWorkItemAsync(receiveTimeout, cancellationToken);
+                return await this.orchestrationService.LockNextTaskOrchestrationWorkItemAsync(TimeSpan.Zero, cancellationToken);
             }
         }
 
@@ -310,24 +402,8 @@ namespace DurableTask.Core
         /// <param name="workItem">The work item to process</param>
         protected async Task<bool> OnProcessWorkItemAsync(TaskOrchestrationWorkItem workItem)
         {
-            // Early check: if this orchestration type is known to be incompatible with this worker,
-            // immediately release the work item to avoid unnecessary processing and latency
-            OrchestrationRuntimeState workItemRuntimeState = workItem.OrchestrationRuntimeState;
-            if (workItemRuntimeState?.Name != null && this.typeFilter.IsTypeIncompatible(workItemRuntimeState.Name, workItemRuntimeState.Version))
-            {
-                this.logHelper.DroppingOrchestrationWorkItem(workItem, $"Orchestration type ({workItemRuntimeState.Name}, {workItemRuntimeState.Version}) is marked as incompatible with this worker");
-                TraceHelper.TraceInstance(
-                    TraceEventType.Information,
-                    "TaskOrchestrationDispatcher-IncompatibleTypeSkipped",
-                    workItemRuntimeState.OrchestrationInstance!,
-                    "Skipping orchestration ({0}, {1}) marked as incompatible with this worker",
-                    workItemRuntimeState.Name,
-                    workItemRuntimeState.Version ?? "");
-                
-                // Release the work item immediately so another worker can pick it up
-                await this.orchestrationService.ReleaseTaskOrchestrationWorkItemAsync(workItem);
-                return true; // Mark as completed to avoid further processing
-            }
+            // Note: Proactive filtering is now done in OnFetchWorkItemAsync, so we expect
+            // all work items that reach here to be compatible with this worker
 
             var messagesToSend = new List<TaskMessage>();
             var timerMessages = new List<TaskMessage>();
