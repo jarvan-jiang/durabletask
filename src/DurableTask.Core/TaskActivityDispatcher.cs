@@ -36,6 +36,7 @@ namespace DurableTask.Core
         readonly DispatchMiddlewarePipeline dispatchPipeline;
         readonly LogHelper logHelper;
         readonly ErrorPropagationMode errorPropagationMode;
+        readonly WorkItemTypeFilter typeFilter;
 
         internal TaskActivityDispatcher(
             IOrchestrationService orchestrationService,
@@ -49,6 +50,7 @@ namespace DurableTask.Core
             this.dispatchPipeline = dispatchPipeline ?? throw new ArgumentNullException(nameof(dispatchPipeline));
             this.logHelper = logHelper;
             this.errorPropagationMode = errorPropagationMode;
+            this.typeFilter = new WorkItemTypeFilter();
 
             this.dispatcher = new WorkItemDispatcher<TaskActivityWorkItem>(
                 "TaskActivityDispatcher",
@@ -89,7 +91,88 @@ namespace DurableTask.Core
 
         Task<TaskActivityWorkItem> OnFetchWorkItemAsync(TimeSpan receiveTimeout, CancellationToken cancellationToken)
         {
-            return this.orchestrationService.LockNextTaskActivityWorkItem(receiveTimeout, cancellationToken);
+            return this.FetchCompatibleActivityWorkItemAsync(receiveTimeout, cancellationToken);
+        }
+
+        /// <summary>
+        /// Proactively fetches activity work items, immediately releasing any that are incompatible with this worker
+        /// </summary>
+        private async Task<TaskActivityWorkItem> FetchCompatibleActivityWorkItemAsync(TimeSpan receiveTimeout, CancellationToken cancellationToken)
+        {
+            var stopwatch = Stopwatch.StartNew();
+            var remainingTimeout = receiveTimeout;
+            
+            while (!cancellationToken.IsCancellationRequested && remainingTimeout > TimeSpan.Zero)
+            {
+                // Fetch work item using the original logic
+                TaskActivityWorkItem workItem = await this.orchestrationService.LockNextTaskActivityWorkItem(remainingTimeout, cancellationToken);
+
+                // If no work item was returned (timeout), return null
+                if (workItem == null)
+                {
+                    // If we can't get any work item, call the original method to maintain the expected behavior
+                    return await this.orchestrationService.LockNextTaskActivityWorkItem(remainingTimeout, cancellationToken);
+                }
+
+                // Extract activity information from the work item
+                TaskMessage taskMessage = workItem.TaskMessage;
+                if (taskMessage?.Event?.EventType == EventType.TaskScheduled)
+                {
+                    var scheduledEvent = (TaskScheduledEvent)taskMessage.Event;
+                    
+                    if (scheduledEvent.Name != null)
+                    {
+                        // First check if it's marked as incompatible from previous attempts
+                        if (this.typeFilter.IsTypeIncompatible(scheduledEvent.Name, scheduledEvent.Version))
+                        {
+                            // Proactively release incompatible work item and continue searching
+                            this.logHelper.TaskActivityDispatcherError(workItem, $"Proactively releasing activity type ({scheduledEvent.Name}, {scheduledEvent.Version}) marked as incompatible with this worker");
+                            TraceHelper.TraceInstance(
+                                TraceEventType.Information,
+                                "TaskActivityDispatcher-ProactiveIncompatibleTypeSkipped",
+                                taskMessage.OrchestrationInstance,
+                                "Proactively releasing activity ({0}, {1}) marked as incompatible with this worker",
+                                scheduledEvent.Name,
+                                scheduledEvent.Version ?? "");
+                            
+                            await this.orchestrationService.AbandonTaskActivityWorkItemAsync(workItem);
+                            
+                            // Update remaining timeout and continue searching
+                            remainingTimeout = receiveTimeout - stopwatch.Elapsed;
+                            continue;
+                        }
+
+                        // Additionally, check if we have the activity registered (proactive check)
+                        var activity = this.objectManager.GetObject(scheduledEvent.Name, scheduledEvent.Version);
+                        if (activity == null)
+                        {
+                            // We don't have this activity type registered, mark it as incompatible and release
+                            this.typeFilter.MarkTypeAsIncompatible(scheduledEvent.Name, scheduledEvent.Version);
+                            
+                            this.logHelper.TaskActivityDispatcherError(workItem, $"Proactively releasing unregistered activity type ({scheduledEvent.Name}, {scheduledEvent.Version})");
+                            TraceHelper.TraceInstance(
+                                TraceEventType.Information,
+                                "TaskActivityDispatcher-ProactiveUnregisteredTypeSkipped",
+                                taskMessage.OrchestrationInstance,
+                                "Proactively releasing unregistered activity ({0}, {1})",
+                                scheduledEvent.Name,
+                                scheduledEvent.Version ?? "");
+                            
+                            await this.orchestrationService.AbandonTaskActivityWorkItemAsync(workItem);
+                            
+                            // Update remaining timeout and continue searching
+                            remainingTimeout = receiveTimeout - stopwatch.Elapsed;
+                            continue;
+                        }
+                    }
+                }
+
+                // This work item is compatible, return it for processing
+                return workItem;
+            }
+
+            // Timeout reached or cancellation requested - fall back to original behavior
+            return await this.orchestrationService.LockNextTaskActivityWorkItem(TimeSpan.Zero, cancellationToken);
         }
 
         async Task OnProcessWorkItemAsync(TaskActivityWorkItem workItem)
@@ -141,6 +224,9 @@ namespace DurableTask.Core
                         new InvalidOperationException(message));
                 }
 
+                // Note: Proactive filtering is now done in OnFetchWorkItemAsync, so we expect
+                // all work items that reach here to be compatible with this worker
+                
                 this.logHelper.TaskActivityStarting(orchestrationInstance, scheduledEvent);
                 TaskActivity? taskActivity = this.objectManager.GetObject(scheduledEvent.Name, scheduledEvent.Version);
 
@@ -177,6 +263,9 @@ namespace DurableTask.Core
                     {
                         if (taskActivity == null)
                         {
+                            // Mark this activity type as incompatible with this worker to avoid future retries
+                            this.typeFilter.MarkTypeAsIncompatible(scheduledEvent.Name, scheduledEvent.Version);
+                            
                             // This likely indicates a deployment error of some kind. Because these unhandled exceptions are
                             // automatically retried, resolving this may require redeploying the app code so that the activity exists again.
                             // CONSIDER: Should this be changed into a permanent error that fails the orchestration? Perhaps

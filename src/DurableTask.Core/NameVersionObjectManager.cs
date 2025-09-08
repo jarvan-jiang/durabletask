@@ -15,6 +15,7 @@ namespace DurableTask.Core
 {
     using System;
     using System.Collections.Generic;
+    using System.Linq;
 
     internal class NameVersionObjectManager<T> : INameVersionObjectManager<T>
     {
@@ -54,6 +55,14 @@ namespace DurableTask.Core
                 }
 
                 return default(T);
+            }
+        }
+
+        public IEnumerable<ObjectCreator<T>> GetRegisteredCreators()
+        {
+            lock (this.thisLock)
+            {
+                return this.creators.Values.ToList();
             }
         }
 
